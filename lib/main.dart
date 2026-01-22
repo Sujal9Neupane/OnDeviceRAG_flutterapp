@@ -541,6 +541,9 @@ class _ChatScreenState extends State<ChatScreen> {
             ? 'No courses found.'
             : 'Select a course to download the knowledge base.';
       });
+      if (_selectedCourseId != null) {
+        await _loadLocalKnowledgeBase(_selectedCourseId!);
+      }
     } catch (error) {
       setState(() {
         _kbStatus = 'Failed to load courses: $error';
@@ -585,7 +588,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       final directory = await getApplicationDocumentsDirectory();
-      final file = File('${directory.path}/knowledge_base_course_$courseId.db');
+      final file = File(_kbPathForCourse(directory.path, courseId));
       await file.writeAsBytes(response.bodyBytes, flush: true);
 
       setState(() {
@@ -602,6 +605,29 @@ class _ChatScreenState extends State<ChatScreen> {
         _isDownloadingKb = false;
       });
     }
+  }
+
+  Future<void> _loadLocalKnowledgeBase(int courseId) async {
+    final directory = await getApplicationDocumentsDirectory();
+    final file = File(_kbPathForCourse(directory.path, courseId));
+    final exists = await file.exists();
+    if (!exists) {
+      setState(() {
+        _kbStatus = 'No local KB found for course $courseId.';
+        _kbDatabase = null;
+        _kbFilePath = null;
+      });
+      return;
+    }
+    setState(() {
+      _kbFilePath = file.path;
+      _kbStatus = 'Using local KB at ${file.path}';
+    });
+    await _openKnowledgeBase(file.path);
+  }
+
+  String _kbPathForCourse(String dirPath, int courseId) {
+    return '$dirPath/knowledge_base_course_$courseId.db';
   }
 
   Widget _buildStatusBar(ThemeData theme) {
@@ -654,6 +680,9 @@ class _ChatScreenState extends State<ChatScreen> {
                       setState(() {
                         _selectedCourseId = value;
                       });
+                      if (value != null) {
+                        _loadLocalKnowledgeBase(value);
+                      }
                     },
             ),
           ),
