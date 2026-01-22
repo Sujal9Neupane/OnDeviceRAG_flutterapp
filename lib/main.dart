@@ -107,6 +107,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isEmbeddingReady = false;
   bool _isRetrieving = false;
   int _retrievalRequestId = 0;
+  bool _multiTurnEnabled = false;
   OrtSession? _ortSession;
   WordPieceTokenizer? _tokenizer;
   List<_RetrievedChunk> _retrievedChunks = [];
@@ -158,10 +159,12 @@ class _ChatScreenState extends State<ChatScreen> {
         _status = 'Loading $_modelName...';
       });
       await FlutterLeapSdkService.loadModel(modelPath: _modelName);
-      _conversation = await FlutterLeapSdkService.createConversation(
-        systemPrompt: _buildSystemPrompt(),
-        generationOptions: const GenerationOptions(maxTokens: _maxTokens),
-      );
+      if (_multiTurnEnabled) {
+        _conversation = await FlutterLeapSdkService.createConversation(
+          systemPrompt: _buildSystemPrompt(),
+          generationOptions: const GenerationOptions(maxTokens: _maxTokens),
+        );
+      }
 
       setState(() {
         _isModelReady = true;
@@ -208,11 +211,12 @@ class _ChatScreenState extends State<ChatScreen> {
       final generationOptions = const GenerationOptions(maxTokens: _maxTokens);
       final systemPrompt = _buildSystemPrompt();
       final augmentedMessage = _buildAugmentedMessage(text);
-      if (_conversation != null) {
-        _conversation!.updateGenerationOptions(generationOptions);
-      }
-      final stream = _conversation != null
-          ? _conversation!.generateResponseStream(augmentedMessage)
+      final stream = _multiTurnEnabled
+          ? await _generateMultiTurnStream(
+              augmentedMessage,
+              generationOptions,
+              systemPrompt,
+            )
           : FlutterLeapSdkService.generateResponseStream(
               augmentedMessage,
               systemPrompt: systemPrompt,
@@ -252,6 +256,38 @@ class _ChatScreenState extends State<ChatScreen> {
         );
         _isGenerating = false;
       });
+    }
+  }
+
+  Future<Stream<String>> _generateMultiTurnStream(
+    String message,
+    GenerationOptions generationOptions,
+    String systemPrompt,
+  ) async {
+    if (_conversation == null) {
+      _conversation = await FlutterLeapSdkService.createConversation(
+        systemPrompt: systemPrompt,
+        generationOptions: generationOptions,
+      );
+    } else {
+      _conversation!.updateGenerationOptions(generationOptions);
+    }
+    return _conversation!.generateResponseStream(message);
+  }
+
+  Future<void> _toggleMultiTurn(bool value) async {
+    setState(() {
+      _multiTurnEnabled = value;
+    });
+    if (!_multiTurnEnabled) {
+      _conversation = null;
+      return;
+    }
+    if (_isModelReady) {
+      _conversation = await FlutterLeapSdkService.createConversation(
+        systemPrompt: _buildSystemPrompt(),
+        generationOptions: const GenerationOptions(maxTokens: _maxTokens),
+      );
     }
   }
 
@@ -367,7 +403,7 @@ class _ChatScreenState extends State<ChatScreen> {
           text: (row['text'] as String?) ?? '',
           score: score,
         );
-        _insertTopK(top, chunk, 3);
+        _insertTopK(top, chunk, 2);
       }
 
       setState(() {
@@ -708,36 +744,55 @@ class _ChatScreenState extends State<ChatScreen> {
       return const SizedBox.shrink();
     }
 
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.tertiaryContainer,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Top retrieved chunks',
-            style: theme.textTheme.titleSmall?.copyWith(
-              color: theme.colorScheme.onTertiaryContainer,
-              fontWeight: FontWeight.w600,
+    return Flexible(
+      fit: FlexFit.loose,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final maxHeight =
+              min(200.0, constraints.maxHeight * 0.3).toDouble();
+          return Container(
+            width: double.infinity,
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.tertiaryContainer,
+              borderRadius: BorderRadius.circular(12),
             ),
-          ),
-          const SizedBox(height: 8),
-          for (var i = 0; i < _retrievedChunks.length; i++)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(
-                'Source ${i + 1} (${_retrievedChunks[i].score.toStringAsFixed(3)}): ${_retrievedChunks[i].text}',
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: theme.colorScheme.onTertiaryContainer,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Top retrieved chunks',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    color: theme.colorScheme.onTertiaryContainer,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
+                const SizedBox(height: 8),
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxHeight: maxHeight),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        for (var i = 0; i < _retrievedChunks.length; i++)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              'Source ${i + 1} (${_retrievedChunks[i].score.toStringAsFixed(3)}): ${_retrievedChunks[i].text}',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onTertiaryContainer,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ),
-        ],
+          );
+        },
       ),
     );
   }
@@ -775,6 +830,20 @@ class _ChatScreenState extends State<ChatScreen> {
       appBar: AppBar(
         title: const Text('Leap Local Chat'),
         actions: [
+          Row(
+            children: [
+              Text(
+                'Multi-turn',
+                style: theme.textTheme.labelMedium,
+              ),
+              Switch(
+                value: _multiTurnEnabled,
+                onChanged: (value) {
+                  _toggleMultiTurn(value);
+                },
+              ),
+            ],
+          ),
           IconButton(
             onPressed: _isDownloadingKb || _selectedCourseId == null
                 ? null
