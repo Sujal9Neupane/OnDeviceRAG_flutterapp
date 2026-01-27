@@ -44,8 +44,10 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
       'https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/LFM2.5-1.2B-Instruct-Q4_K_M.gguf?download=true';
   static const String _hyperclovaxModelUrl =
       'https://huggingface.co/kexplo/HyperCLOVAX-SEED-Text-Instruct-1.5B-Q4_K_M-GGUF/resolve/main/hyperclovax-seed-text-instruct-1.5b-q4_k_m.gguf?download=true';
-  static const String _embeddingGemmaEmbedderUrl =
-      'https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf?download=true';
+  static const String _bgeM3KoreanEmbedderUrl =
+      'https://huggingface.co/hongkeon/bge-m3-korean-Q4_K_M-GGUF/resolve/main/bge-m3-korean-q4_k_m.gguf?download=true';
+  static const String _e5TinyEmbedderUrl =
+      'https://huggingface.co/exp-models/dragonkue-KoEn-E5-Tiny/resolve/main/ggml-model-q4_k_m.gguf?download=true';
   final TextEditingController _modelPathController = TextEditingController();
   final TextEditingController _modelUrlController = TextEditingController(
     text:
@@ -56,7 +58,7 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
   final TextEditingController _embedderModelUrlController =
       TextEditingController(
     text:
-        _embeddingGemmaEmbedderUrl,
+        _bgeM3KoreanEmbedderUrl,
   );
   final TextEditingController _embedderPoolingController =
       TextEditingController(text: '1');
@@ -96,6 +98,11 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
   int _totalChunks = 0;
   int _ragChunkCount = 0;
   String _lastRetrievedContext = '';
+  bool _retrievalDebugEnabled = false;
+  String _retrievalDebugInfo = '';
+  int _lastRetrievalRowCount = 0;
+  int _lastRetrievedChunkCount = 0;
+  int _lastRetrievedContextLength = 0;
 
   @override
   void initState() {
@@ -258,7 +265,6 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
     final embedding = await _embedText('test embedding', isQuery: true);
     testStart.stop();
     if (embedding == null || embedding.isEmpty) {
-      _setStatus('Embedder test failed.');
       return;
     }
     _setStatus(
@@ -511,8 +517,20 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
       );
     }
 
+    final maxContextTokens = max(128, contextSize - maxTokens);
+    const minRagTokens = 64;
+    final availableForSystem = max(0, maxContextTokens - minRagTokens);
+    final systemPromptBudget = min(256, availableForSystem);
+    final ragBudget = maxContextTokens - systemPromptBudget;
+    var systemPrompt = _systemPromptController.text.trim();
+    systemPrompt = _truncateToMaxTokens(systemPrompt, systemPromptBudget);
+    if (retrievedContext.isNotEmpty) {
+      retrievedContext = _truncateToMaxTokens(retrievedContext, ragBudget);
+    }
+
     setState(() {
       _lastRetrievedContext = retrievedContext;
+      _lastRetrievedContextLength = retrievedContext.length;
       _messages.add(ChatMessage(Role.user, prompt));
       _messages.add(ChatMessage(Role.assistant, ''));
       _isGenerating = true;
@@ -523,10 +541,10 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
 
     _stopwatch = Stopwatch()..start();
 
-    final systemPrompt = _systemPromptController.text.trim();
-    final ragPrompt = retrievedContext.isEmpty
+    var ragPrompt = retrievedContext.isEmpty
         ? systemPrompt
         : '$systemPrompt\n\nContext:\n$retrievedContext';
+    ragPrompt = _truncateToMaxTokens(ragPrompt, maxContextTokens);
 
     final request = OpenAiRequest(
       modelPath: modelPath,
@@ -844,25 +862,63 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
     if (_ragChunkCount == 0) return '';
 
     final queryEmbedding = await _embedText(query, isQuery: true);
-    if (queryEmbedding == null) return '';
+    if (queryEmbedding == null) {
+      if (_retrievalDebugEnabled) {
+        _retrievalDebugInfo = 'Retrieval debug: embed failed';
+      }
+      _lastRetrievalRowCount = 0;
+      _lastRetrievedChunkCount = 0;
+      return '';
+    }
 
     final queryNorm = _vectorNorm(queryEmbedding);
-    if (queryNorm == 0) return '';
+    if (queryNorm == 0) {
+      if (_retrievalDebugEnabled) {
+        _retrievalDebugInfo = 'Retrieval debug: query norm=0';
+      }
+      _lastRetrievalRowCount = 0;
+      _lastRetrievedChunkCount = 0;
+      return '';
+    }
 
     final rows = await _ragDb!.query('chunks');
-    if (rows.isEmpty) return '';
+    if (rows.isEmpty) {
+      if (_retrievalDebugEnabled) {
+        _retrievalDebugInfo = 'Retrieval debug: 0 rows';
+      }
+      _lastRetrievalRowCount = 0;
+      _lastRetrievedChunkCount = 0;
+      return '';
+    }
 
     final scored = <_ScoredChunk>[];
+    var skippedZeroNorm = 0;
     for (final row in rows) {
       final bytes = row['embedding'] as Uint8List;
       final embd = _blobToFloat32List(bytes);
       final norm = (row['norm'] as num).toDouble();
-      if (norm == 0) continue;
+      if (norm == 0) {
+        skippedZeroNorm += 1;
+        continue;
+      }
       final score = _dot(queryEmbedding, embd) / (queryNorm * norm);
       scored.add(_ScoredChunk(row['content'] as String, score));
     }
 
+    if (_retrievalDebugEnabled) {
+      final topScores = scored
+          .map((c) => c.score)
+          .toList()
+        ..sort((a, b) => b.compareTo(a));
+      final top3 = topScores.take(3).map((s) => s.toStringAsFixed(3)).join(', ');
+      _retrievalDebugInfo =
+          'Retrieval debug: rows=${rows.length}, scored=${scored.length}, '
+          'zeroNorm=$skippedZeroNorm, top=[$top3], budget=$maxChars';
+    }
+
     scored.sort((a, b) => b.score.compareTo(a.score));
+    _lastRetrievalRowCount = rows.length;
+    _lastRetrievedChunkCount = min(2, scored.length);
     final top = scored.take(2).map((c) => c.content).toList();
     final combined = top.join('\n\n');
     return _truncateText(combined, maxChars);
@@ -909,7 +965,7 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
                   ),
                   const SizedBox(height: 12),
                 ],
-                if (_lastRetrievedContext.isNotEmpty) ...[
+                ...[
                   Text('Retrieved context', style: theme.textTheme.titleSmall),
                   const SizedBox(height: 6),
                   Container(
@@ -919,7 +975,13 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
                       color: theme.colorScheme.surfaceContainerHighest,
                       borderRadius: BorderRadius.circular(10),
                     ),
-                    child: SelectableText(_lastRetrievedContext),
+                    child: SelectableText(
+                      _ragChunkCount == 0
+                          ? 'No documents indexed yet.'
+                          : _lastRetrievedContext.isEmpty
+                              ? 'No context retrieved for this query.'
+                              : _lastRetrievedContext,
+                    ),
                   ),
                   const SizedBox(height: 12),
                 ],
@@ -1117,9 +1179,12 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
           runSpacing: 12,
           children: [
             OutlinedButton(
-              onPressed: () =>
-                  _applyEmbedderUrl(_embeddingGemmaEmbedderUrl),
-              child: const Text('Use EmbeddingGemma Q4_0'),
+              onPressed: () => _applyEmbedderUrl(_bgeM3KoreanEmbedderUrl),
+              child: const Text('Use BGE-M3 Korean Q4_K_M'),
+            ),
+            OutlinedButton(
+              onPressed: () => _applyEmbedderUrl(_e5TinyEmbedderUrl),
+              child: const Text('Use E5 Tiny'),
             ),
             OutlinedButton(
               onPressed: _importEmbedderModel,
@@ -1171,6 +1236,19 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
               ),
           ],
         ),
+        const SizedBox(height: 16),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Retrieval debug'),
+          subtitle: const Text('Show retrieval scoring details in status.'),
+          value: _retrievalDebugEnabled,
+          onChanged: (value) {
+            setState(() {
+              _retrievalDebugEnabled = value;
+              _retrievalDebugInfo = '';
+            });
+          },
+        ),
         const SizedBox(height: 24),
         Text('Generation settings', style: theme.textTheme.titleLarge),
         const SizedBox(height: 8),
@@ -1218,6 +1296,18 @@ class _FllamaHomePageState extends State<FllamaHomePage> {
             'Indexing: $_indexedChunks / $_totalChunks',
             style: theme.textTheme.bodySmall,
           ),
+        if (_ragChunkCount > 0) ...[
+          const SizedBox(height: 6),
+          Text(
+            'Retrieved: $_lastRetrievedChunkCount / $_lastRetrievalRowCount '
+            'chunks • ${_lastRetrievedContextLength} chars',
+            style: theme.textTheme.bodySmall,
+          ),
+        ],
+        if (_retrievalDebugEnabled && _retrievalDebugInfo.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text(_retrievalDebugInfo, style: theme.textTheme.bodySmall),
+        ],
       ],
     );
   }
